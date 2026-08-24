@@ -107,10 +107,13 @@ go-orchestrator/          module root, package `saga` — public API:
                            as phases need it.
 ```
 
-Concrete pluggable implementations (e.g. an in-memory store) are expected
-to live in their own subpackages as they are introduced, so that adding a
-Postgres or Redis store later is an additive package, not a change to the
-core API. No such subpackages exist yet.
+Concrete pluggable implementations (e.g. an in-memory store) live in
+their own subpackages, so that adding a Postgres or Redis store later is
+an additive package, not a change to the core API. `store/memory`
+(package `memory`) is the first one: an in-memory `Store` implementation
+that imports the root package for `Execution`/`Store`/etc. — a
+one-directional dependency, since the root package never needs to import
+back into a concrete store implementation.
 
 **Note on the state machine:** the transition rules for `Status` and
 `StepStatus` live in the root package as unexported functions
@@ -135,5 +138,10 @@ implemented in v1.
 
 This library is being built incrementally, one phase at a time. See the
 project's phase roadmap (tracked outside this file) for what is currently
-implemented. As of this writing, only the repository scaffold exists — no
-saga engine, execution, or persistence behavior has been implemented yet.
+implemented. As of this writing: saga definition, sequential forward
+execution, reverse-order compensation, an in-memory Store (with Save
+failures treated as fatal to Execute, so persistence failures are never
+silently ignored), and configurable per-step/per-saga retries (fixed
+delay, exponential backoff, jitter, and non-retryable errors) all exist.
+Not yet implemented: timeouts, crash recovery, idempotency keys,
+execution locking, hooks/events, and pluggable observability.

@@ -14,19 +14,31 @@ import (
 // together with an error describing why the run did not reach
 // StatusCompleted, if any.
 //
-// If a step fails, or ctx is cancelled partway through, every
-// already-succeeded step is compensated in reverse order before Execute
-// returns (skipping any step with a nil Compensate, which has nothing to
-// undo). The step that failed is never compensated: its Action never
-// completed, so there is nothing to undo. If no step had succeeded yet,
-// compensation is skipped entirely and the execution goes straight to
-// StatusFailed.
+// If a step's Action fails, it is retried per the step's effective
+// RetryPolicy (its own, via WithStepRetryPolicy, or otherwise the saga's,
+// via WithRetryPolicy; NoRetry if neither is configured) unless the
+// error was wrapped with NonRetryable. Once retries are exhausted (or
+// ctx is cancelled partway through, including during a retry wait),
+// every already-succeeded step is compensated in reverse order before
+// Execute returns (skipping any step with a nil Compensate, which has
+// nothing to undo). The step that failed is never compensated: its
+// Action never completed, so there is nothing to undo. If no step had
+// succeeded yet, compensation is skipped entirely and the execution goes
+// straight to StatusFailed.
 //
 // The returned error always preserves the original failure — via
 // errors.Is/As — whether or not compensation was needed. If compensation
 // itself also failed for one or more steps, the returned error
 // additionally wraps ErrCompensationFailed; the execution's Steps carry
 // the per-step detail of which compensations failed and why.
+//
+// If a Store is configured (WithStore), Execute persists the execution
+// after every Status or StepStatus change. A Store failure is treated as
+// fatal to the call: Execute returns immediately with that error, since
+// silently continuing would contradict the durability a Store is meant
+// to provide. Attempt counts within a single step's retry loop are only
+// persisted once that step reaches a final outcome, not attempt by
+// attempt.
 //
 // Execute freezes the Definition on first call (see Definition.Freeze),
 // so it is safe to call Execute concurrently with other Execute calls,
@@ -47,8 +59,13 @@ func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error)
 	for i, step := range d.steps {
 		exec.Steps[i] = StepExecution{Name: step.Name, Status: StepStatusPending}
 	}
+	if err := d.save(ctx, exec); err != nil {
+		return exec, err
+	}
 
-	mustTransition(exec, StatusRunning)
+	if err := d.transitionExec(ctx, exec, StatusRunning); err != nil {
+		return exec, err
+	}
 
 	data := input
 	for i, step := range d.steps {
@@ -61,44 +78,120 @@ func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error)
 
 		exec.CurrentStep = step.Name
 		stepExec := &exec.Steps[i]
-		mustTransitionStep(stepExec, StepStatusRunning)
-		stepExec.Attempts++
+		if err := d.transitionStep(ctx, exec, stepExec, StepStatusRunning); err != nil {
+			return exec, err
+		}
 
-		out, err := step.Action(ctx, data)
-		if err != nil {
-			stepExec.Error = err.Error()
-			mustTransitionStep(stepExec, StepStatusFailed)
+		out, stepErr := d.runStep(ctx, stepExec, step, data)
+		if stepErr != nil {
+			stepExec.Error = stepErr.Error()
+			if err := d.transitionStep(ctx, exec, stepExec, StepStatusFailed); err != nil {
+				return exec, err
+			}
 			exec.CurrentStep = ""
-			return exec, d.abort(ctx, exec, i, &StepError{Step: step.Name, Err: err})
+			return exec, d.abort(ctx, exec, i, stepErr)
 		}
 		stepExec.Output = out
-		mustTransitionStep(stepExec, StepStatusSucceeded)
+		if err := d.transitionStep(ctx, exec, stepExec, StepStatusSucceeded); err != nil {
+			return exec, err
+		}
 		data = out
 	}
 
 	exec.CurrentStep = ""
 	exec.Output = data
-	mustTransition(exec, StatusCompleted)
+	if err := d.transitionExec(ctx, exec, StatusCompleted); err != nil {
+		return exec, err
+	}
 	return exec, nil
 }
 
+// runStep invokes step's Action, retrying per its effective RetryPolicy
+// (see retryPolicyFor) until it succeeds, a NonRetryable error comes
+// back, attempts are exhausted, or ctx ends. It returns the step's
+// output on success. On failure it returns either ctx.Err() (if ctx is
+// what ended the loop) or a *StepError wrapping the action's own error —
+// never a bare, unwrapped action error.
+func (d *Definition) runStep(ctx context.Context, stepExec *StepExecution, step StepDefinition, data any) (any, error) {
+	policy := d.retryPolicyFor(step)
+	for attempt := 1; ; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		stepExec.Attempts++
+		out, err := step.Action(ctx, data)
+		if err == nil {
+			return out, nil
+		}
+		if isNonRetryable(err) || attempt >= policy.MaxAttempts() {
+			return nil, &StepError{Step: step.Name, Err: err}
+		}
+		if waitErr := sleepOrDone(ctx, policy.Delay(attempt+1)); waitErr != nil {
+			return nil, waitErr
+		}
+	}
+}
+
+// retryPolicyFor returns step's own RetryPolicy if it has one (set via
+// WithStepRetryPolicy), otherwise the saga-level policy from
+// WithRetryPolicy, otherwise NoRetry.
+func (d *Definition) retryPolicyFor(step StepDefinition) RetryPolicy {
+	if step.retryPolicy != nil {
+		return step.retryPolicy
+	}
+	return d.retryPolicy
+}
+
+// sleepOrDone waits for delay to elapse, returning nil, or returns
+// ctx.Err() if ctx ends first. A non-positive delay still checks ctx
+// once rather than sleeping.
+func sleepOrDone(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // abort ends a run that did not complete successfully. originalErr is
-// why: either the error a step's Action returned, or ctx.Err() if ctx
-// was cancelled between steps. If any step before failedAt succeeded,
-// abort compensates those steps in reverse order; otherwise there is
-// nothing to undo and the execution goes straight to StatusFailed.
+// why: either the error runStep returned for the failed step, or
+// ctx.Err() if ctx was cancelled between steps. If any step before
+// failedAt succeeded, abort compensates those steps in reverse order;
+// otherwise there is nothing to undo and the execution goes straight to
+// StatusFailed.
 //
 // originalErr is always preserved as, or wrapped within, the returned
-// error — including when compensation itself fails.
+// error — including when compensation itself fails. If persisting a
+// state change fails partway through, that Store error is returned
+// instead (see Execute's doc comment on Store failures).
 func (d *Definition) abort(ctx context.Context, exec *Execution, failedAt int, originalErr error) error {
 	exec.Error = originalErr.Error()
 
 	if !anySucceeded(exec.Steps[:failedAt]) {
-		mustTransition(exec, StatusFailed)
+		if err := d.transitionExec(ctx, exec, StatusFailed); err != nil {
+			return err
+		}
 		return originalErr
 	}
 
-	mustTransition(exec, StatusCompensating)
+	if err := d.transitionExec(ctx, exec, StatusCompensating); err != nil {
+		return err
+	}
+
 	// Compensation must still run to completion even when ctx is itself
 	// the reason we're aborting (cancelled or timed out) — otherwise a
 	// caller giving up on the request would also abandon cleanup,
@@ -106,14 +199,21 @@ func (d *Definition) abort(ctx context.Context, exec *Execution, failedAt int, o
 	// WithoutCancel keeps any request-scoped values while dropping the
 	// cancellation signal.
 	compensateCtx := context.WithoutCancel(ctx)
-	ok := d.compensate(compensateCtx, exec, failedAt)
+	ok, err := d.compensate(compensateCtx, exec, failedAt)
 	exec.CurrentStep = ""
+	if err != nil {
+		return err
+	}
 
 	if !ok {
-		mustTransition(exec, StatusCompensationFailed)
+		if err := d.transitionExec(ctx, exec, StatusCompensationFailed); err != nil {
+			return err
+		}
 		return fmt.Errorf("%w: %w", ErrCompensationFailed, originalErr)
 	}
-	mustTransition(exec, StatusCompensated)
+	if err := d.transitionExec(ctx, exec, StatusCompensated); err != nil {
+		return err
+	}
 	return originalErr
 }
 
@@ -136,8 +236,9 @@ func anySucceeded(steps []StepExecution) bool {
 // It keeps compensating remaining steps even after one fails, so as much
 // of the saga as possible gets rolled back rather than stopping at the
 // first compensation error. It reports whether every attempted
-// compensation succeeded.
-func (d *Definition) compensate(ctx context.Context, exec *Execution, failedAt int) bool {
+// compensation succeeded; a non-nil error means persisting a state
+// change failed and compensation was abandoned partway through.
+func (d *Definition) compensate(ctx context.Context, exec *Execution, failedAt int) (bool, error) {
 	ok := true
 	for i := failedAt - 1; i >= 0; i-- {
 		stepExec := &exec.Steps[i]
@@ -150,32 +251,51 @@ func (d *Definition) compensate(ctx context.Context, exec *Execution, failedAt i
 		}
 
 		exec.CurrentStep = stepExec.Name
-		mustTransitionStep(stepExec, StepStatusCompensating)
-		if err := compensateFn(ctx, stepExec.Output); err != nil {
-			stepExec.Error = err.Error()
-			mustTransitionStep(stepExec, StepStatusCompensationFailed)
+		if err := d.transitionStep(ctx, exec, stepExec, StepStatusCompensating); err != nil {
+			return false, err
+		}
+		if cErr := compensateFn(ctx, stepExec.Output); cErr != nil {
+			stepExec.Error = cErr.Error()
+			if err := d.transitionStep(ctx, exec, stepExec, StepStatusCompensationFailed); err != nil {
+				return false, err
+			}
 			ok = false
 			continue
 		}
-		mustTransitionStep(stepExec, StepStatusCompensated)
+		if err := d.transitionStep(ctx, exec, stepExec, StepStatusCompensated); err != nil {
+			return false, err
+		}
 	}
-	return ok
+	return ok, nil
 }
 
-// mustTransition applies a Status transition that the engine itself
-// controls and knows to be legal. A failure here means the engine drove
-// an execution's status incorrectly, which is a bug in this package, not
-// a condition callers can hit — so it panics rather than threading an
-// error return through every call site.
-func mustTransition(exec *Execution, to Status) {
+// transitionExec applies a Status transition that the engine itself
+// controls and knows to be legal, then persists exec. A rejected
+// transition means the engine drove an execution's status incorrectly,
+// a bug in this package rather than a condition callers can hit, so it
+// panics rather than threading an error return through every call site.
+// A Store failure, in contrast, is a real runtime condition and is
+// returned normally.
+func (d *Definition) transitionExec(ctx context.Context, exec *Execution, to Status) error {
 	if err := exec.transition(to, time.Now()); err != nil {
 		panic(err)
 	}
+	return d.save(ctx, exec)
 }
 
-// mustTransitionStep is mustTransition's StepExecution counterpart.
-func mustTransitionStep(step *StepExecution, to StepStatus) {
+// transitionStep is transitionExec's StepExecution counterpart.
+func (d *Definition) transitionStep(ctx context.Context, exec *Execution, step *StepExecution, to StepStatus) error {
 	if err := step.transition(to, time.Now()); err != nil {
 		panic(err)
 	}
+	return d.save(ctx, exec)
+}
+
+// save persists exec via the Definition's configured Store, wrapping any
+// error with enough context to identify which execution failed to save.
+func (d *Definition) save(ctx context.Context, exec *Execution) error {
+	if err := d.store.Save(ctx, exec); err != nil {
+		return fmt.Errorf("saga: failed to persist execution %q: %w", exec.ID, err)
+	}
+	return nil
 }

@@ -173,3 +173,45 @@ func TestExecution_transition_FullCompensationPath(t *testing.T) {
 		t.Error("CompletedAt should be set once Compensated is reached")
 	}
 }
+
+func TestExecution_Clone_IndependentOfOriginal(t *testing.T) {
+	started := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	original := &Execution{
+		ID:     "exec-1",
+		Status: StatusRunning,
+		Steps: []StepExecution{
+			{Name: "A", Status: StepStatusSucceeded, StartedAt: &started},
+		},
+		StartedAt: &started,
+	}
+
+	clone := original.Clone()
+
+	// Mutating the clone must not affect the original.
+	clone.Status = StatusCompleted
+	clone.Steps[0].Status = StepStatusCompensated
+	*clone.StartedAt = started.Add(time.Hour)
+	*clone.Steps[0].StartedAt = started.Add(time.Hour)
+
+	if original.Status != StatusRunning {
+		t.Errorf("original.Status = %q, want unchanged %q", original.Status, StatusRunning)
+	}
+	if original.Steps[0].Status != StepStatusSucceeded {
+		t.Errorf("original.Steps[0].Status = %q, want unchanged %q", original.Steps[0].Status, StepStatusSucceeded)
+	}
+	if !original.StartedAt.Equal(started) {
+		t.Errorf("original.StartedAt = %v, want unchanged %v", original.StartedAt, started)
+	}
+	if !original.Steps[0].StartedAt.Equal(started) {
+		t.Errorf("original.Steps[0].StartedAt = %v, want unchanged %v", original.Steps[0].StartedAt, started)
+	}
+}
+
+func TestExecution_Clone_NilTimestampsStayNil(t *testing.T) {
+	original := &Execution{ID: "exec-1", Status: StatusPending}
+	clone := original.Clone()
+
+	if clone.StartedAt != nil || clone.CompletedAt != nil {
+		t.Error("Clone of an Execution with nil timestamps should also have nil timestamps")
+	}
+}

@@ -82,3 +82,38 @@ func TestStepError_WrapsCompensationFailure(t *testing.T) {
 		t.Error("errors.Is(err, ErrCompensationFailed) = false, want true")
 	}
 }
+
+func TestNonRetryable_WrapsAndPreservesCause(t *testing.T) {
+	cause := errors.New("invalid order: missing SKU")
+	wrapped := NonRetryable(cause)
+
+	if !errors.Is(wrapped, cause) {
+		t.Error("errors.Is(wrapped, cause) = false, want true")
+	}
+	if wrapped.Error() != cause.Error() {
+		t.Errorf("Error() = %q, want %q", wrapped.Error(), cause.Error())
+	}
+	if !isNonRetryable(wrapped) {
+		t.Error("isNonRetryable(wrapped) = false, want true")
+	}
+}
+
+func TestNonRetryable_Nil(t *testing.T) {
+	if NonRetryable(nil) != nil {
+		t.Error("NonRetryable(nil) should return nil")
+	}
+}
+
+func TestIsNonRetryable_OrdinaryErrorIsRetryable(t *testing.T) {
+	if isNonRetryable(errors.New("transient network error")) {
+		t.Error("an ordinary error should not be considered non-retryable")
+	}
+}
+
+func TestIsNonRetryable_SeesThroughWrapping(t *testing.T) {
+	cause := errors.New("invalid input")
+	wrapped := fmt.Errorf("step failed: %w", NonRetryable(cause))
+	if !isNonRetryable(wrapped) {
+		t.Error("isNonRetryable should see through additional wrapping via %w")
+	}
+}

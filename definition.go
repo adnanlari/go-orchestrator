@@ -25,22 +25,31 @@ import (
 // first use, however many goroutines call Execute at once). Once frozen,
 // a Definition is read-only and safe for unrestricted concurrent use.
 type Definition struct {
-	name    string
-	steps   []StepDefinition
-	stepSet map[string]bool
-	frozen  atomic.Bool
+	name        string
+	steps       []StepDefinition
+	stepSet     map[string]bool
+	frozen      atomic.Bool
+	store       Store
+	retryPolicy RetryPolicy
 }
 
-// New creates a new, empty saga Definition with the given name. It
-// panics if name is empty.
-func New(name string) *Definition {
+// New creates a new, empty saga Definition with the given name and
+// applies opts (see WithStore, WithRetryPolicy). It panics if name is
+// empty.
+func New(name string, opts ...Option) *Definition {
 	if strings.TrimSpace(name) == "" {
 		panic("saga: saga name must not be empty")
 	}
-	return &Definition{
-		name:    name,
-		stepSet: make(map[string]bool),
+	d := &Definition{
+		name:        name,
+		stepSet:     make(map[string]bool),
+		store:       noopStore{},
+		retryPolicy: NoRetry(),
 	}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
 }
 
 // Name returns the saga's name.

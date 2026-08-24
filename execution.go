@@ -5,10 +5,9 @@ import "time"
 // Execution is the durable record of one run of a Saga definition.
 //
 // It is pure data: constructing, reading, or mutating an Execution has no
-// side effects and does not run any saga. The engine (introduced in a
-// later phase) is responsible for creating and updating these records,
-// and a Store (introduced in a later phase) is responsible for persisting
-// them.
+// side effects and does not run any saga. The engine is responsible for
+// creating and updating these records, and a Store is responsible for
+// persisting them.
 type Execution struct {
 	// ID uniquely identifies this execution. Generation is the engine's
 	// responsibility.
@@ -45,6 +44,40 @@ type Execution struct {
 	// CompletedAt is when the execution reached a terminal status. Nil
 	// until then.
 	CompletedAt *time.Time
+}
+
+// Clone returns a deep copy of e: its Steps slice and every *time.Time
+// pointer are copied rather than shared. Input, Output, and each step's
+// Output are copied by reference only (they are `any`, so a true deep
+// copy isn't possible without reflection) — if step data is itself a
+// mutable pointer type, avoid mutating it after it has been returned
+// from a step, or a Store holding a Clone could observe the mutation.
+//
+// Store implementations should call Clone before persisting or
+// returning an Execution, so that the engine mutating the live
+// Execution it is working with afterward cannot alter what was already
+// persisted, and vice versa.
+func (e *Execution) Clone() *Execution {
+	cp := *e
+	cp.Steps = make([]StepExecution, len(e.Steps))
+	copy(cp.Steps, e.Steps)
+	for i := range cp.Steps {
+		cp.Steps[i].StartedAt = clonedTime(e.Steps[i].StartedAt)
+		cp.Steps[i].CompletedAt = clonedTime(e.Steps[i].CompletedAt)
+		cp.Steps[i].CompensationStartedAt = clonedTime(e.Steps[i].CompensationStartedAt)
+		cp.Steps[i].CompensatedAt = clonedTime(e.Steps[i].CompensatedAt)
+	}
+	cp.StartedAt = clonedTime(e.StartedAt)
+	cp.CompletedAt = clonedTime(e.CompletedAt)
+	return &cp
+}
+
+func clonedTime(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	return &cp
 }
 
 // transition validates that moving from e's current Status to "to" is
