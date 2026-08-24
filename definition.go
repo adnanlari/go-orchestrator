@@ -3,6 +3,7 @@ package saga
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 )
 
 // Definition is an ordered, named list of steps that together describe a
@@ -17,14 +18,17 @@ import (
 // fail immediately and loudly rather than being silently swallowed. This
 // mirrors how http.ServeMux.Handle panics on a duplicate pattern.
 //
-// A Definition is not safe for concurrent AddStep/Freeze calls. Once
-// Freeze has been called, a Definition is read-only and safe for
-// concurrent use.
+// AddStep is not safe for concurrent use, either with itself or with
+// Freeze — building a Definition is expected to happen in a single
+// goroutine. Freeze itself, however, is safe to call concurrently with
+// other Freeze calls (Execute relies on this to freeze the Definition on
+// first use, however many goroutines call Execute at once). Once frozen,
+// a Definition is read-only and safe for unrestricted concurrent use.
 type Definition struct {
 	name    string
 	steps   []StepDefinition
 	stepSet map[string]bool
-	frozen  bool
+	frozen  atomic.Bool
 }
 
 // New creates a new, empty saga Definition with the given name. It
@@ -53,7 +57,7 @@ func (d *Definition) Name() string {
 //   - step.Name duplicates a step already added to this Definition
 //   - step.Action is nil
 func (d *Definition) AddStep(step StepDefinition) *Definition {
-	if d.frozen {
+	if d.frozen.Load() {
 		panic(fmt.Sprintf("saga: cannot add step %q to frozen saga %q", step.Name, d.name))
 	}
 	name := strings.TrimSpace(step.Name)
@@ -81,12 +85,13 @@ func (d *Definition) Steps() []StepDefinition {
 }
 
 // Freeze marks the Definition as complete. After Freeze, AddStep panics
-// on any further call. Freeze is idempotent.
+// on any further call. Freeze is idempotent and safe to call
+// concurrently with other Freeze calls.
 func (d *Definition) Freeze() {
-	d.frozen = true
+	d.frozen.Store(true)
 }
 
 // Frozen reports whether Freeze has been called.
 func (d *Definition) Frozen() bool {
-	return d.frozen
+	return d.frozen.Load()
 }

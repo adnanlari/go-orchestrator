@@ -18,6 +18,12 @@ type Execution struct {
 	SagaName string
 	// Status is the execution's current status.
 	Status Status
+	// Input is the value the execution was started with (the "input"
+	// argument to Execute).
+	Input any
+	// Output is the value produced by the last step to run, once the
+	// execution reaches StatusCompleted. Nil until then.
+	Output any
 	// Steps are this execution's step records, in the same order as the
 	// saga definition's steps.
 	Steps []StepExecution
