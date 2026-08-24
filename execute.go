@@ -2,6 +2,7 @@ package saga
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/adnanlari/go-orchestrator/internal/idgen"
@@ -13,14 +14,23 @@ import (
 // together with an error describing why the run did not reach
 // StatusCompleted, if any.
 //
+// If a step fails, or ctx is cancelled partway through, every
+// already-succeeded step is compensated in reverse order before Execute
+// returns (skipping any step with a nil Compensate, which has nothing to
+// undo). The step that failed is never compensated: its Action never
+// completed, so there is nothing to undo. If no step had succeeded yet,
+// compensation is skipped entirely and the execution goes straight to
+// StatusFailed.
+//
+// The returned error always preserves the original failure — via
+// errors.Is/As — whether or not compensation was needed. If compensation
+// itself also failed for one or more steps, the returned error
+// additionally wraps ErrCompensationFailed; the execution's Steps carry
+// the per-step detail of which compensations failed and why.
+//
 // Execute freezes the Definition on first call (see Definition.Freeze),
 // so it is safe to call Execute concurrently with other Execute calls,
 // but not concurrently with AddStep.
-//
-// This phase does not yet compensate steps that already succeeded when a
-// later step fails or the context is cancelled — a step failure simply
-// ends the execution in StatusFailed. Reverse-order compensation is
-// added in a later phase.
 func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error) {
 	d.Freeze()
 
@@ -45,7 +55,7 @@ func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error)
 		select {
 		case <-ctx.Done():
 			exec.CurrentStep = ""
-			return exec, fail(exec, ctx.Err())
+			return exec, d.abort(ctx, exec, i, ctx.Err())
 		default:
 		}
 
@@ -59,8 +69,9 @@ func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error)
 			stepExec.Error = err.Error()
 			mustTransitionStep(stepExec, StepStatusFailed)
 			exec.CurrentStep = ""
-			return exec, fail(exec, &StepError{Step: step.Name, Err: err})
+			return exec, d.abort(ctx, exec, i, &StepError{Step: step.Name, Err: err})
 		}
+		stepExec.Output = out
 		mustTransitionStep(stepExec, StepStatusSucceeded)
 		data = out
 	}
@@ -71,12 +82,84 @@ func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error)
 	return exec, nil
 }
 
-// fail records err on exec and transitions it to StatusFailed. It
-// returns err unchanged so callers can `return exec, fail(exec, err)`.
-func fail(exec *Execution, err error) error {
-	exec.Error = err.Error()
-	mustTransition(exec, StatusFailed)
-	return err
+// abort ends a run that did not complete successfully. originalErr is
+// why: either the error a step's Action returned, or ctx.Err() if ctx
+// was cancelled between steps. If any step before failedAt succeeded,
+// abort compensates those steps in reverse order; otherwise there is
+// nothing to undo and the execution goes straight to StatusFailed.
+//
+// originalErr is always preserved as, or wrapped within, the returned
+// error — including when compensation itself fails.
+func (d *Definition) abort(ctx context.Context, exec *Execution, failedAt int, originalErr error) error {
+	exec.Error = originalErr.Error()
+
+	if !anySucceeded(exec.Steps[:failedAt]) {
+		mustTransition(exec, StatusFailed)
+		return originalErr
+	}
+
+	mustTransition(exec, StatusCompensating)
+	// Compensation must still run to completion even when ctx is itself
+	// the reason we're aborting (cancelled or timed out) — otherwise a
+	// caller giving up on the request would also abandon cleanup,
+	// leaving already-succeeded steps permanently un-compensated.
+	// WithoutCancel keeps any request-scoped values while dropping the
+	// cancellation signal.
+	compensateCtx := context.WithoutCancel(ctx)
+	ok := d.compensate(compensateCtx, exec, failedAt)
+	exec.CurrentStep = ""
+
+	if !ok {
+		mustTransition(exec, StatusCompensationFailed)
+		return fmt.Errorf("%w: %w", ErrCompensationFailed, originalErr)
+	}
+	mustTransition(exec, StatusCompensated)
+	return originalErr
+}
+
+// anySucceeded reports whether any step in steps reached
+// StepStatusSucceeded.
+func anySucceeded(steps []StepExecution) bool {
+	for _, s := range steps {
+		if s.Status == StepStatusSucceeded {
+			return true
+		}
+	}
+	return false
+}
+
+// compensate runs the compensating action, in reverse order, for every
+// step before failedAt that succeeded and has a non-nil Compensate.
+// Steps with a nil Compensate are skipped (nothing to undo) and are left
+// at StepStatusSucceeded rather than marked compensated.
+//
+// It keeps compensating remaining steps even after one fails, so as much
+// of the saga as possible gets rolled back rather than stopping at the
+// first compensation error. It reports whether every attempted
+// compensation succeeded.
+func (d *Definition) compensate(ctx context.Context, exec *Execution, failedAt int) bool {
+	ok := true
+	for i := failedAt - 1; i >= 0; i-- {
+		stepExec := &exec.Steps[i]
+		if stepExec.Status != StepStatusSucceeded {
+			continue
+		}
+		compensateFn := d.steps[i].Compensate
+		if compensateFn == nil {
+			continue
+		}
+
+		exec.CurrentStep = stepExec.Name
+		mustTransitionStep(stepExec, StepStatusCompensating)
+		if err := compensateFn(ctx, stepExec.Output); err != nil {
+			stepExec.Error = err.Error()
+			mustTransitionStep(stepExec, StepStatusCompensationFailed)
+			ok = false
+			continue
+		}
+		mustTransitionStep(stepExec, StepStatusCompensated)
+	}
+	return ok
 }
 
 // mustTransition applies a Status transition that the engine itself

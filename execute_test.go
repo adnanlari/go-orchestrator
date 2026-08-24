@@ -14,6 +14,13 @@ func recordingAction(name string, order *[]string) ActionFunc {
 	}
 }
 
+func recordingCompensate(name string, order *[]string) CompensateFunc {
+	return func(ctx context.Context, data any) error {
+		*order = append(*order, name)
+		return nil
+	}
+}
+
 func TestExecute_RunsStepsInOrder(t *testing.T) {
 	var order []string
 	d := New("order_creation").
@@ -116,6 +123,9 @@ func TestExecute_DataFlowsThroughSteps(t *testing.T) {
 }
 
 func TestExecute_StepFailureStopsExecution(t *testing.T) {
+	// A succeeded, so its Compensate now runs as part of aborting —
+	// see TestExecute_CompensatesInReverseOrder for order/skip coverage.
+	// This test just confirms C (after the failed step) never runs.
 	var order []string
 	failingErr := errors.New("insufficient stock")
 	d := New("order_creation").
@@ -141,11 +151,13 @@ func TestExecute_StepFailureStopsExecution(t *testing.T) {
 	if want := []string{"A", "B"}; len(order) != len(want) || order[0] != want[0] || order[1] != want[1] {
 		t.Errorf("order = %v, want %v (C must not run)", order, want)
 	}
-	if exec.Status != StatusFailed {
-		t.Errorf("Status = %q, want %q", exec.Status, StatusFailed)
+	// A succeeded, so compensation runs and the execution ends rolled
+	// back, not bare-failed.
+	if exec.Status != StatusCompensated {
+		t.Errorf("Status = %q, want %q", exec.Status, StatusCompensated)
 	}
-	if exec.Steps[0].Status != StepStatusSucceeded {
-		t.Errorf("step A Status = %q, want %q", exec.Steps[0].Status, StepStatusSucceeded)
+	if exec.Steps[0].Status != StepStatusCompensated {
+		t.Errorf("step A Status = %q, want %q", exec.Steps[0].Status, StepStatusCompensated)
 	}
 	if exec.Steps[1].Status != StepStatusFailed {
 		t.Errorf("step B Status = %q, want %q", exec.Steps[1].Status, StepStatusFailed)
@@ -197,6 +209,14 @@ func TestExecute_CancelledMidRun(t *testing.T) {
 	if exec.Steps[2].Status != StepStatusPending {
 		t.Errorf("step C Status = %q, want %q", exec.Steps[2].Status, StepStatusPending)
 	}
+	// A and B both succeeded before cancellation was noticed, so
+	// compensation still runs for both, even though ctx is cancelled.
+	if exec.Status != StatusCompensated {
+		t.Errorf("Status = %q, want %q", exec.Status, StatusCompensated)
+	}
+	if exec.Steps[0].Status != StepStatusCompensated || exec.Steps[1].Status != StepStatusCompensated {
+		t.Errorf("A/B should be Compensated: A=%q B=%q", exec.Steps[0].Status, exec.Steps[1].Status)
+	}
 }
 
 func TestExecute_EmptyDefinitionCompletesImmediately(t *testing.T) {
@@ -225,6 +245,188 @@ func TestExecute_FreezesDefinition(t *testing.T) {
 	}
 	if !d.Frozen() {
 		t.Error("Execute should freeze the Definition")
+	}
+}
+
+func TestExecute_CompensatesInReverseOrder(t *testing.T) {
+	var actionOrder, compensateOrder []string
+	failingErr := errors.New("insufficient stock")
+
+	d := New("order_creation").
+		AddStep(Step("A", recordingAction("A", &actionOrder), recordingCompensate("A", &compensateOrder))).
+		AddStep(Step("B", recordingAction("B", &actionOrder), recordingCompensate("B", &compensateOrder))).
+		AddStep(Step("C", func(ctx context.Context, data any) (any, error) {
+			actionOrder = append(actionOrder, "C")
+			return nil, failingErr
+		}, recordingCompensate("C", &compensateOrder)))
+
+	exec, err := d.Execute(context.Background(), "input")
+	if !errors.Is(err, failingErr) {
+		t.Fatalf("errors.Is(err, failingErr) = false, err = %v", err)
+	}
+
+	want := []string{"B", "A"} // reverse order; C must never appear
+	if len(compensateOrder) != len(want) {
+		t.Fatalf("compensateOrder = %v, want %v", compensateOrder, want)
+	}
+	for i, name := range want {
+		if compensateOrder[i] != name {
+			t.Errorf("compensateOrder[%d] = %q, want %q", i, compensateOrder[i], name)
+		}
+	}
+	if exec.Status != StatusCompensated {
+		t.Errorf("Status = %q, want %q", exec.Status, StatusCompensated)
+	}
+	if exec.Steps[0].Status != StepStatusCompensated || exec.Steps[1].Status != StepStatusCompensated {
+		t.Errorf("A/B should be Compensated: A=%q B=%q", exec.Steps[0].Status, exec.Steps[1].Status)
+	}
+	if exec.Steps[2].Status != StepStatusFailed {
+		t.Errorf("C Status = %q, want %q", exec.Steps[2].Status, StepStatusFailed)
+	}
+}
+
+func TestExecute_OriginalErrorPreservedAfterCompensation(t *testing.T) {
+	failingErr := errors.New("insufficient stock")
+	d := New("order_creation").
+		AddStep(Step("A", noopAction, noopCompensate)).
+		AddStep(Step("B", func(ctx context.Context, data any) (any, error) { return nil, failingErr }, noopCompensate))
+
+	exec, err := d.Execute(context.Background(), "input")
+	if !errors.Is(err, failingErr) {
+		t.Fatalf("errors.Is(err, failingErr) = false, err = %v", err)
+	}
+	var stepErr *StepError
+	if !errors.As(err, &stepErr) || stepErr.Step != "B" {
+		t.Fatalf("expected *StepError for step B, got %v", err)
+	}
+	if exec.Error != stepErr.Error() {
+		t.Errorf("exec.Error = %q, want %q", exec.Error, stepErr.Error())
+	}
+	if exec.Status != StatusCompensated {
+		t.Errorf("Status = %q, want %q", exec.Status, StatusCompensated)
+	}
+}
+
+func TestExecute_CompensationFailure(t *testing.T) {
+	failingErr := errors.New("insufficient stock")
+	compErrB := errors.New("refund gateway down")
+
+	d := New("order_creation").
+		AddStep(Step("A", noopAction, noopCompensate)).
+		AddStep(Step("B", noopAction, func(ctx context.Context, data any) error { return compErrB })).
+		AddStep(Step("C", func(ctx context.Context, data any) (any, error) { return nil, failingErr }, noopCompensate))
+
+	exec, err := d.Execute(context.Background(), "input")
+
+	if !errors.Is(err, ErrCompensationFailed) {
+		t.Errorf("errors.Is(err, ErrCompensationFailed) = false, err = %v", err)
+	}
+	if !errors.Is(err, failingErr) {
+		t.Errorf("original error not preserved: errors.Is(err, failingErr) = false, err = %v", err)
+	}
+	if exec.Status != StatusCompensationFailed {
+		t.Errorf("Status = %q, want %q", exec.Status, StatusCompensationFailed)
+	}
+	if exec.Steps[1].Status != StepStatusCompensationFailed {
+		t.Errorf("step B Status = %q, want %q", exec.Steps[1].Status, StepStatusCompensationFailed)
+	}
+	if exec.Steps[1].Error != compErrB.Error() {
+		t.Errorf("step B Error = %q, want %q", exec.Steps[1].Error, compErrB.Error())
+	}
+	// A's compensation must still be attempted even though B's compensation failed.
+	if exec.Steps[0].Status != StepStatusCompensated {
+		t.Errorf("step A Status = %q, want %q (compensation must continue past a failure)", exec.Steps[0].Status, StepStatusCompensated)
+	}
+}
+
+func TestExecute_MultipleCompensationFailures(t *testing.T) {
+	failingErr := errors.New("boom")
+	compErrA := errors.New("compensate A failed")
+	compErrB := errors.New("compensate B failed")
+
+	d := New("order_creation").
+		AddStep(Step("A", noopAction, func(ctx context.Context, data any) error { return compErrA })).
+		AddStep(Step("B", noopAction, func(ctx context.Context, data any) error { return compErrB })).
+		AddStep(Step("C", func(ctx context.Context, data any) (any, error) { return nil, failingErr }, noopCompensate))
+
+	exec, err := d.Execute(context.Background(), "input")
+
+	if !errors.Is(err, ErrCompensationFailed) {
+		t.Errorf("errors.Is(err, ErrCompensationFailed) = false, err = %v", err)
+	}
+	if exec.Status != StatusCompensationFailed {
+		t.Errorf("Status = %q, want %q", exec.Status, StatusCompensationFailed)
+	}
+	if exec.Steps[0].Status != StepStatusCompensationFailed {
+		t.Errorf("step A Status = %q, want %q", exec.Steps[0].Status, StepStatusCompensationFailed)
+	}
+	if exec.Steps[0].Error != compErrA.Error() {
+		t.Errorf("step A Error = %q, want %q", exec.Steps[0].Error, compErrA.Error())
+	}
+	if exec.Steps[1].Status != StepStatusCompensationFailed {
+		t.Errorf("step B Status = %q, want %q", exec.Steps[1].Status, StepStatusCompensationFailed)
+	}
+	if exec.Steps[1].Error != compErrB.Error() {
+		t.Errorf("step B Error = %q, want %q", exec.Steps[1].Error, compErrB.Error())
+	}
+}
+
+func TestExecute_NilCompensateSkipped(t *testing.T) {
+	failingErr := errors.New("boom")
+	d := New("order_creation").
+		AddStep(Step("A", noopAction, nil)). // nothing to undo
+		AddStep(Step("B", func(ctx context.Context, data any) (any, error) { return nil, failingErr }, noopCompensate))
+
+	exec, err := d.Execute(context.Background(), "input")
+	if !errors.Is(err, failingErr) {
+		t.Fatalf("errors.Is(err, failingErr) = false, err = %v", err)
+	}
+	// Nothing to undo for A: it stays Succeeded rather than being
+	// marked Compensated, since no compensating action ever ran.
+	if exec.Steps[0].Status != StepStatusSucceeded {
+		t.Errorf("step A Status = %q, want %q", exec.Steps[0].Status, StepStatusSucceeded)
+	}
+	if exec.Status != StatusCompensated {
+		t.Errorf("Status = %q, want %q", exec.Status, StatusCompensated)
+	}
+}
+
+func TestExecute_FirstStepFailsSkipsCompensation(t *testing.T) {
+	var compensateOrder []string
+	failingErr := errors.New("boom")
+	d := New("order_creation").
+		AddStep(Step("A", func(ctx context.Context, data any) (any, error) { return nil, failingErr }, recordingCompensate("A", &compensateOrder)))
+
+	exec, err := d.Execute(context.Background(), "input")
+	if !errors.Is(err, failingErr) {
+		t.Fatalf("errors.Is(err, failingErr) = false, err = %v", err)
+	}
+	if len(compensateOrder) != 0 {
+		t.Errorf("no compensation should run when no step succeeded, got %v", compensateOrder)
+	}
+	if exec.Status != StatusFailed {
+		t.Errorf("Status = %q, want %q", exec.Status, StatusFailed)
+	}
+}
+
+func TestExecute_CompensateReceivesStepOutput(t *testing.T) {
+	var gotData any
+	failingErr := errors.New("boom")
+	d := New("order_creation").
+		AddStep(Step("A", func(ctx context.Context, data any) (any, error) {
+			return "A-output", nil
+		}, func(ctx context.Context, data any) error {
+			gotData = data
+			return nil
+		})).
+		AddStep(Step("B", func(ctx context.Context, data any) (any, error) { return nil, failingErr }, noopCompensate))
+
+	_, err := d.Execute(context.Background(), "input")
+	if !errors.Is(err, failingErr) {
+		t.Fatalf("errors.Is(err, failingErr) = false, err = %v", err)
+	}
+	if gotData != "A-output" {
+		t.Errorf("compensate received %v, want %q", gotData, "A-output")
 	}
 }
 

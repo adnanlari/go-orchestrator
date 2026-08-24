@@ -17,6 +17,10 @@ type StepExecution struct {
 	// Attempts is the number of times the forward action has been
 	// invoked for this step in this execution.
 	Attempts int
+	// Output is the value returned by this step's Action once it
+	// succeeds. It is what Compensate is called with if this step later
+	// needs to be undone. Nil until the step succeeds.
+	Output any
 	// Error is the message from the most recent failure of this step's
 	// forward or compensating action, if any. Empty when there has been
 	// no failure.
