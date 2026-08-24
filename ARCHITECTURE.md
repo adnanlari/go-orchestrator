@@ -96,16 +96,33 @@ go-orchestrator/          module root, package `saga` — public API:
                            saga/step/execution definitions, engine entry
                            points, functional options, pluggable-interface
                            types (Store, RetryPolicy, Logger, Metrics,
-                           Tracer, Hooks, EventPublisher).
-  internal/                implementation details not part of the public
-                           API (e.g. the state machine, ID generation).
-                           Populated incrementally as phases need it.
+                           Tracer, Hooks, EventPublisher). Also holds
+                           implementation details that must live in this
+                           package to avoid an import cycle (see below),
+                           kept unexported so they are not part of the
+                           public API.
+  internal/                implementation details that do NOT need to
+                           reference the public types in the root package
+                           (e.g. ID generation). Populated incrementally
+                           as phases need it.
 ```
 
 Concrete pluggable implementations (e.g. an in-memory store) are expected
 to live in their own subpackages as they are introduced, so that adding a
 Postgres or Redis store later is an additive package, not a change to the
 core API. No such subpackages exist yet.
+
+**Note on the state machine:** the transition rules for `Status` and
+`StepStatus` live in the root package as unexported functions
+(`transitions.go`), not in `internal/statemachine` as originally sketched
+above. `Status`/`StepStatus` are public types defined in the root
+package, and the engine that will apply transitions also lives in the
+root package (Phase 4+) — an `internal/statemachine` package would need
+to import the root package for those types, while the root package would
+need to import it back to use the transition logic, an illegal import
+cycle. Keeping the transition tables unexported in the root package
+achieves the same goal (not part of the public API, single source of
+truth, no scattered mutation) without the cycle.
 
 ## What is explicitly out of scope for v1
 

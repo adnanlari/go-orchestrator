@@ -31,3 +31,32 @@ func (e *StepError) Error() string {
 func (e *StepError) Unwrap() error {
 	return e.Err
 }
+
+// InvalidTransitionError indicates an attempted Status transition that
+// the state machine does not allow (for example, PENDING directly to
+// COMPLETED). It signals a bug in the engine, not a user-facing runtime
+// failure: valid transitions are fully enumerated and enforced
+// internally, so this should never occur in normal operation.
+type InvalidTransitionError struct {
+	From Status
+	To   Status
+}
+
+// Error implements the error interface.
+func (e *InvalidTransitionError) Error() string {
+	return fmt.Sprintf("saga: invalid status transition %s -> %s", e.From, e.To)
+}
+
+// InvalidStepTransitionError indicates an attempted StepStatus transition
+// that the state machine does not allow. Like InvalidTransitionError, it
+// signals a bug in the engine rather than a user-facing runtime failure.
+type InvalidStepTransitionError struct {
+	Step string
+	From StepStatus
+	To   StepStatus
+}
+
+// Error implements the error interface.
+func (e *InvalidStepTransitionError) Error() string {
+	return fmt.Sprintf("saga: invalid step %q status transition %s -> %s", e.Step, e.From, e.To)
+}

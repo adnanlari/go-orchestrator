@@ -36,3 +36,33 @@ type StepExecution struct {
 	// Nil until then.
 	CompensatedAt *time.Time
 }
+
+// transition validates that moving from s's current Status to "to" is
+// allowed by the state machine, and if so applies it: Status and the
+// appropriate timestamp field are updated together so they can never
+// disagree with Status. now is injected rather than read from time.Now
+// so callers can produce deterministic timestamps in tests.
+//
+// On an invalid transition, s is left unchanged and an
+// *InvalidStepTransitionError is returned.
+func (s *StepExecution) transition(to StepStatus, now time.Time) error {
+	if !canTransitionStepStatus(s.Status, to) {
+		return &InvalidStepTransitionError{Step: s.Name, From: s.Status, To: to}
+	}
+	s.Status = to
+	switch to {
+	case StepStatusRunning:
+		started := now
+		s.StartedAt = &started
+	case StepStatusSucceeded, StepStatusFailed:
+		completed := now
+		s.CompletedAt = &completed
+	case StepStatusCompensating:
+		compStarted := now
+		s.CompensationStartedAt = &compStarted
+	case StepStatusCompensated, StepStatusCompensationFailed:
+		compDone := now
+		s.CompensatedAt = &compDone
+	}
+	return nil
+}

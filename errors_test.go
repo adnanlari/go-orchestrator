@@ -53,6 +53,24 @@ func TestErrCompensationFailed_Is(t *testing.T) {
 	}
 }
 
+func TestInvalidTransitionError_Error(t *testing.T) {
+	err := &InvalidTransitionError{From: StatusPending, To: StatusCompleted}
+	got := err.Error()
+	want := "saga: invalid status transition PENDING -> COMPLETED"
+	if got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
+func TestInvalidStepTransitionError_Error(t *testing.T) {
+	err := &InvalidStepTransitionError{Step: "charge_payment", From: StepStatusFailed, To: StepStatusCompensating}
+	got := err.Error()
+	want := `saga: invalid step "charge_payment" status transition FAILED -> COMPENSATING`
+	if got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
 func TestStepError_WrapsCompensationFailure(t *testing.T) {
 	// A StepError can itself wrap ErrCompensationFailed, so callers can
 	// detect both which step failed to compensate and that it was a

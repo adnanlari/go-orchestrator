@@ -40,3 +40,29 @@ type Execution struct {
 	// until then.
 	CompletedAt *time.Time
 }
+
+// transition validates that moving from e's current Status to "to" is
+// allowed by the state machine, and if so applies it: Status, UpdatedAt,
+// and (when entering StatusRunning or a terminal status) StartedAt or
+// CompletedAt are updated together so they can never disagree with
+// Status. now is injected rather than read from time.Now so callers can
+// produce deterministic timestamps in tests.
+//
+// On an invalid transition, e is left unchanged and an
+// *InvalidTransitionError is returned.
+func (e *Execution) transition(to Status, now time.Time) error {
+	if !canTransitionStatus(e.Status, to) {
+		return &InvalidTransitionError{From: e.Status, To: to}
+	}
+	e.Status = to
+	e.UpdatedAt = now
+	if to == StatusRunning {
+		started := now
+		e.StartedAt = &started
+	}
+	if to.IsTerminal() {
+		completed := now
+		e.CompletedAt = &completed
+	}
+	return nil
+}
