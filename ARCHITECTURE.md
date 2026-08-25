@@ -141,7 +141,11 @@ project's phase roadmap (tracked outside this file) for what is currently
 implemented. As of this writing: saga definition, sequential forward
 execution, reverse-order compensation, an in-memory Store (with Save
 failures treated as fatal to Execute, so persistence failures are never
-silently ignored), and configurable per-step/per-saga retries (fixed
-delay, exponential backoff, jitter, and non-retryable errors) all exist.
-Not yet implemented: timeouts, crash recovery, idempotency keys,
-execution locking, hooks/events, and pluggable observability.
+silently ignored), configurable per-step/per-saga retries (fixed delay,
+exponential backoff, jitter, and non-retryable errors), and saga-level
+and step-level timeouts (via context.WithTimeoutCause/context.Cause, so
+a saga timeout, a step timeout, and plain external cancellation are all
+distinguishable via errors.As even though they share the same
+context.Context cancellation mechanism) all exist. Not yet implemented:
+crash recovery, idempotency keys, execution locking, hooks/events, and
+pluggable observability.

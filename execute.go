@@ -2,6 +2,7 @@ package saga
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -40,11 +41,31 @@ import (
 // persisted once that step reaches a final outcome, not attempt by
 // attempt.
 //
+// If a saga timeout is configured (WithTimeout), it bounds this entire
+// call; exceeding it aborts with a *SagaTimeoutError, handled exactly
+// like any other failure (compensation runs if anything had succeeded).
+// If a step exceeds its own timeout (WithStepTimeout), that attempt
+// fails with a *StepTimeoutError and is retried per the step's
+// RetryPolicy, unless the saga-level timeout or an explicit external
+// cancellation of ctx ended things first — those always take precedence.
+// Every timeout and cancellation error can still be matched with
+// errors.Is(err, context.DeadlineExceeded) or
+// errors.Is(err, context.Canceled) respectively, in addition to the more
+// specific errors.As checks.
+//
 // Execute freezes the Definition on first call (see Definition.Freeze),
 // so it is safe to call Execute concurrently with other Execute calls,
 // but not concurrently with AddStep.
 func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error) {
 	d.Freeze()
+
+	var sagaTimeoutErr *SagaTimeoutError
+	if d.timeout > 0 {
+		sagaTimeoutErr = &SagaTimeoutError{Saga: d.name, Timeout: d.timeout}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeoutCause(ctx, d.timeout, sagaTimeoutErr)
+		defer cancel()
+	}
 
 	now := time.Now()
 	exec := &Execution{
@@ -72,7 +93,7 @@ func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error)
 		select {
 		case <-ctx.Done():
 			exec.CurrentStep = ""
-			return exec, d.abort(ctx, exec, i, ctx.Err())
+			return exec, d.abort(ctx, exec, i, context.Cause(ctx))
 		default:
 		}
 
@@ -82,7 +103,7 @@ func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error)
 			return exec, err
 		}
 
-		out, stepErr := d.runStep(ctx, stepExec, step, data)
+		out, stepErr := d.runStep(ctx, sagaTimeoutErr, stepExec, step, data)
 		if stepErr != nil {
 			stepExec.Error = stepErr.Error()
 			if err := d.transitionStep(ctx, exec, stepExec, StepStatusFailed); err != nil {
@@ -108,23 +129,47 @@ func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error)
 
 // runStep invokes step's Action, retrying per its effective RetryPolicy
 // (see retryPolicyFor) until it succeeds, a NonRetryable error comes
-// back, attempts are exhausted, or ctx ends. It returns the step's
-// output on success. On failure it returns either ctx.Err() (if ctx is
-// what ended the loop) or a *StepError wrapping the action's own error —
+// back, attempts are exhausted, or ctx ends. sagaTimeoutErr is the cause
+// Execute attached to ctx if a saga-level timeout was configured
+// (WithTimeout), or nil if not.
+//
+// A successful return is honored even if ctx happened to end during or
+// because of that same attempt — for example, an Action that both
+// completes its work and triggers cancellation as a side effect — with
+// one exception: if sagaTimeoutErr is specifically why ctx ended (our
+// own configured deadline, not some unrelated cancellation), the result
+// is discarded exactly as callAction already does for a step's own
+// timeout, since a result arriving after our own deadline can't be
+// trusted as timely either way. Only a failed attempt otherwise consults
+// ctx, to decide whether the failure should stop retries immediately. On
+// failure it returns either context.Cause(ctx) (if the outer ctx is what
+// ended things — a saga timeout or explicit cancellation, which always
+// takes precedence over retrying) or a *StepError wrapping the attempt's
+// own error (which may itself be a *StepTimeoutError; see callAction) —
 // never a bare, unwrapped action error.
-func (d *Definition) runStep(ctx context.Context, stepExec *StepExecution, step StepDefinition, data any) (any, error) {
+func (d *Definition) runStep(ctx context.Context, sagaTimeoutErr *SagaTimeoutError, stepExec *StepExecution, step StepDefinition, data any) (any, error) {
 	policy := d.retryPolicyFor(step)
+	timeout := step.timeout
 	for attempt := 1; ; attempt++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		if ctx.Err() != nil {
+			return nil, context.Cause(ctx)
 		}
 
 		stepExec.Attempts++
-		out, err := step.Action(ctx, data)
+		out, err := d.callAction(ctx, step, timeout, data)
+
+		if sagaTimeoutErr != nil && errors.Is(context.Cause(ctx), sagaTimeoutErr) {
+			return nil, sagaTimeoutErr
+		}
 		if err == nil {
 			return out, nil
+		}
+
+		// The outer (saga-level or caller) context ending takes
+		// precedence over the attempt's own error, and makes retrying
+		// pointless.
+		if ctx.Err() != nil {
+			return nil, context.Cause(ctx)
 		}
 		if isNonRetryable(err) || attempt >= policy.MaxAttempts() {
 			return nil, &StepError{Step: step.Name, Err: err}
@@ -133,6 +178,31 @@ func (d *Definition) runStep(ctx context.Context, stepExec *StepExecution, step 
 			return nil, waitErr
 		}
 	}
+}
+
+// callAction invokes step.Action once, bounded by timeout if timeout >
+// 0. If the step's own timeout is specifically what elapses — as
+// opposed to the outer ctx ending for some unrelated reason — that
+// result is discarded, even if Action ignores the timeout and eventually
+// returns success anyway, since a result arriving after the deadline
+// this step was configured with can't be trusted as timely. An outer
+// ctx ending is left for the caller (runStep) to handle, since a step
+// timeout and a saga-level/external cancellation warrant different
+// responses (a step timeout retries per policy; the other never does).
+func (d *Definition) callAction(ctx context.Context, step StepDefinition, timeout time.Duration, data any) (any, error) {
+	if timeout <= 0 {
+		return step.Action(ctx, data)
+	}
+
+	stepTimeoutErr := &StepTimeoutError{Step: step.Name, Timeout: timeout}
+	actionCtx, cancel := context.WithTimeoutCause(ctx, timeout, stepTimeoutErr)
+	defer cancel()
+
+	out, err := step.Action(actionCtx, data)
+	if errors.Is(context.Cause(actionCtx), stepTimeoutErr) {
+		return nil, stepTimeoutErr
+	}
+	return out, err
 }
 
 // retryPolicyFor returns step's own RetryPolicy if it has one (set via
@@ -146,13 +216,13 @@ func (d *Definition) retryPolicyFor(step StepDefinition) RetryPolicy {
 }
 
 // sleepOrDone waits for delay to elapse, returning nil, or returns
-// ctx.Err() if ctx ends first. A non-positive delay still checks ctx
-// once rather than sleeping.
+// context.Cause(ctx) if ctx ends first. A non-positive delay still
+// checks ctx once rather than sleeping.
 func sleepOrDone(ctx context.Context, delay time.Duration) error {
 	if delay <= 0 {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		default:
 			return nil
 		}
@@ -163,7 +233,7 @@ func sleepOrDone(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return context.Cause(ctx)
 	}
 }
 

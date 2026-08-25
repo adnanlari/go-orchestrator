@@ -1,14 +1,24 @@
 package saga
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // ActionFunc is a step's forward action. It receives the execution's
 // context and the saga data as produced by the previous step (or the
 // Execute input, for the first step), and returns the data to hand to
 // the next step along with an error if the action failed.
 //
-// ActionFunc must respect ctx cancellation; the engine does not guarantee
-// it will wait for an ActionFunc that ignores it.
+// ctx carries any configured saga timeout (WithTimeout) and step timeout
+// (WithStepTimeout) as a deadline. Go's context cancellation is
+// cooperative, not forceful: Execute calls Action synchronously and
+// cannot abandon it mid-call, so ActionFunc should check ctx and return
+// promptly when it ends. If Action ignores ctx and keeps running past a
+// configured timeout, Execute simply will not return until Action does —
+// but whatever Action eventually returns is discarded in favor of a
+// timeout error, since a result arriving after the deadline can't be
+// trusted as timely.
 type ActionFunc func(ctx context.Context, data any) (any, error)
 
 // CompensateFunc is a step's compensating action. It receives the
@@ -37,6 +47,9 @@ type StepDefinition struct {
 	// alone. Nil means "use the saga's policy" (see
 	// Definition.retryPolicyFor). Set via WithStepRetryPolicy.
 	retryPolicy RetryPolicy
+	// timeout bounds a single attempt of Action. Zero means no per-step
+	// timeout. Set via WithStepTimeout.
+	timeout time.Duration
 }
 
 // StepOption configures a StepDefinition at construction time. Pass
@@ -52,9 +65,23 @@ func WithStepRetryPolicy(policy RetryPolicy) StepOption {
 	return func(s *StepDefinition) { s.retryPolicy = policy }
 }
 
+// WithStepTimeout bounds how long a single attempt of this step's Action
+// may take. If a retry policy allows more than one attempt, each attempt
+// gets its own fresh timeout window. If an attempt does not return
+// within timeout, that attempt is treated as a failure with a
+// *StepTimeoutError — even if Action eventually returns a result, since
+// a late result can't be trusted as timely — and is retried like any
+// other failure, per the step's effective RetryPolicy.
+//
+// timeout <= 0 means no per-step timeout (the default).
+func WithStepTimeout(timeout time.Duration) StepOption {
+	return func(s *StepDefinition) { s.timeout = timeout }
+}
+
 // Step constructs a StepDefinition from a name, a forward action, and a
-// compensating action, applying any opts (see WithStepRetryPolicy).
-// compensate may be nil if the step has nothing to undo.
+// compensating action, applying any opts (see WithStepRetryPolicy,
+// WithStepTimeout). compensate may be nil if the step has nothing to
+// undo.
 //
 // Step performs no validation beyond applying opts; AddStep validates
 // the step when it is added to a Definition.

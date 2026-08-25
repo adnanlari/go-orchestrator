@@ -1,8 +1,10 @@
 package saga
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ErrCompensationFailed is a sentinel error indicating that a step's
@@ -102,4 +104,50 @@ func NonRetryable(err error) error {
 func isNonRetryable(err error) bool {
 	var nre *nonRetryableError
 	return errors.As(err, &nre)
+}
+
+// SagaTimeoutError indicates a saga's overall execution did not reach a
+// terminal status within its configured timeout (see WithTimeout). It
+// wraps context.DeadlineExceeded, so errors.Is(err,
+// context.DeadlineExceeded) still reports true for callers that only
+// care about the general case.
+type SagaTimeoutError struct {
+	Saga    string
+	Timeout time.Duration
+}
+
+// Error implements the error interface.
+func (e *SagaTimeoutError) Error() string {
+	return fmt.Sprintf("saga: %q exceeded its %s timeout", e.Saga, e.Timeout)
+}
+
+// Unwrap enables errors.Is(err, context.DeadlineExceeded) to see through
+// a SagaTimeoutError.
+func (e *SagaTimeoutError) Unwrap() error {
+	return context.DeadlineExceeded
+}
+
+// StepTimeoutError indicates one attempt of a step's Action did not
+// return within its configured timeout (see WithStepTimeout). It wraps
+// context.DeadlineExceeded, so errors.Is(err, context.DeadlineExceeded)
+// still reports true for callers that only care about the general case.
+//
+// A StepTimeoutError is retried like any other step failure, per the
+// step's effective RetryPolicy, unless a saga-level timeout or explicit
+// cancellation also ended ctx — that always takes precedence and stops
+// retries immediately.
+type StepTimeoutError struct {
+	Step    string
+	Timeout time.Duration
+}
+
+// Error implements the error interface.
+func (e *StepTimeoutError) Error() string {
+	return fmt.Sprintf("saga: step %q exceeded its %s timeout", e.Step, e.Timeout)
+}
+
+// Unwrap enables errors.Is(err, context.DeadlineExceeded) to see through
+// a StepTimeoutError.
+func (e *StepTimeoutError) Unwrap() error {
+	return context.DeadlineExceeded
 }

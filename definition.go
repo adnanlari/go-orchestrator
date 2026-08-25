@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // Definition is an ordered, named list of steps that together describe a
@@ -31,11 +32,12 @@ type Definition struct {
 	frozen      atomic.Bool
 	store       Store
 	retryPolicy RetryPolicy
+	timeout     time.Duration
 }
 
 // New creates a new, empty saga Definition with the given name and
-// applies opts (see WithStore, WithRetryPolicy). It panics if name is
-// empty.
+// applies opts (see WithStore, WithRetryPolicy, WithTimeout). It panics
+// if name is empty.
 func New(name string, opts ...Option) *Definition {
 	if strings.TrimSpace(name) == "" {
 		panic("saga: saga name must not be empty")
