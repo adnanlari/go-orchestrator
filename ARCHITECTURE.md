@@ -148,10 +148,20 @@ a saga timeout, a step timeout, and plain external cancellation are all
 distinguishable via errors.As even though they share the same
 context.Context cancellation mechanism), crash recovery
 (RecoveryManager, built on a new Lister interface for enumerating
-incomplete executions), and idempotency (OperationID(ctx), a stable key
-per (execution, step) delivered via context.Context rather than a step
-function signature change, unchanged across retries and crash recovery)
-all exist. Execute and recovery now share one underlying resumable
-engine (Definition.resume): a fresh Execute call is simply resuming a
-brand-new, all-Pending Execution. Not yet implemented: execution
-locking, hooks/events, and pluggable observability.
+incomplete executions), idempotency (OperationID(ctx), a stable key per
+(execution, step) delivered via context.Context rather than a step
+function signature change, unchanged across retries and crash recovery),
+execution locking (an optional Locker interface a Store can implement;
+leases renew automatically on every persisted state change so a
+still-progressing execution never loses its lease to a TTL expiring
+mid-run), lifecycle hooks and events (Event/EventPublisher, covering all
+nine lifecycle points; a panicking publisher is recovered and can never
+affect the saga), and pluggable observability (a *slog.Logger from the
+standard library — no custom Logger interface — plus minimal Metrics and
+Tracer interfaces, requiring neither Prometheus nor OpenTelemetry as a
+dependency) all exist. Execute and recovery now share one underlying
+resumable engine (Definition.resume, via an internal runState that
+carries per-call lock/tracing state): a fresh Execute call is simply
+resuming a brand-new, all-Pending Execution. Not yet implemented:
+examples and a full README pass (guarantees, limitations, quick start),
+and the hardening pass (fuzzing, benchmarks, static analysis).

@@ -44,8 +44,10 @@ type RecoveryResult struct {
 	Execution *Execution
 	// Err is the same error Execute would have returned had the process
 	// not exited, ErrRecoverySkipped if RecoverSkipInFlight left it
-	// untouched, or an error if no Definition was registered for this
-	// execution's SagaName.
+	// untouched, an *ExecutionLockedError if the registered saga's Store
+	// implements Locker and another worker currently holds this
+	// execution's lease, or an error if no Definition was registered for
+	// this execution's SagaName.
 	Err error
 }
 

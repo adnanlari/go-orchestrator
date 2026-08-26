@@ -2,6 +2,7 @@ package saga
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -33,11 +34,17 @@ type Definition struct {
 	store       Store
 	retryPolicy RetryPolicy
 	timeout     time.Duration
+	lockTTL     time.Duration
+	publisher   EventPublisher
+	logger      *slog.Logger
+	metrics     Metrics
+	tracer      Tracer
 }
 
 // New creates a new, empty saga Definition with the given name and
-// applies opts (see WithStore, WithRetryPolicy, WithTimeout). It panics
-// if name is empty.
+// applies opts (see WithStore, WithRetryPolicy, WithTimeout, WithLockTTL,
+// WithEventPublisher, WithLogger, WithMetrics, WithTracer). It panics if
+// name is empty.
 func New(name string, opts ...Option) *Definition {
 	if strings.TrimSpace(name) == "" {
 		panic("saga: saga name must not be empty")
@@ -47,6 +54,7 @@ func New(name string, opts ...Option) *Definition {
 		stepSet:     make(map[string]bool),
 		store:       noopStore{},
 		retryPolicy: NoRetry(),
+		lockTTL:     DefaultLockTTL,
 	}
 	for _, opt := range opts {
 		opt(d)

@@ -1,6 +1,9 @@
 package saga
 
-import "time"
+import (
+	"log/slog"
+	"time"
+)
 
 // Option configures a Definition at construction time. Pass options to
 // New.
@@ -39,4 +42,55 @@ func WithRetryPolicy(policy RetryPolicy) Option {
 // as long as ctx and each step's own timeout allow.
 func WithTimeout(timeout time.Duration) Option {
 	return func(d *Definition) { d.timeout = timeout }
+}
+
+// WithLockTTL configures how long an execution lease is held before it
+// must be renewed (see Locker). Only relevant when the configured Store
+// also implements Locker; ignored otherwise. Defaults to DefaultLockTTL.
+func WithLockTTL(ttl time.Duration) Option {
+	return func(d *Definition) { d.lockTTL = ttl }
+}
+
+// WithEventPublisher configures where lifecycle Events are sent (see
+// EventPublisher). If not given, no events are published — Execute and
+// RecoveryManager.Recover behave exactly as they did before Event
+// existed. Use MultiPublisher to send events to more than one
+// destination. Panics if publisher is nil.
+func WithEventPublisher(publisher EventPublisher) Option {
+	if publisher == nil {
+		panic("saga: event publisher must not be nil")
+	}
+	return func(d *Definition) { d.publisher = publisher }
+}
+
+// WithLogger configures structured logging of lifecycle events (the same
+// moments that produce an Event; see EventPublisher) to logger. This
+// takes a *slog.Logger directly, from the standard library's log/slog
+// package, rather than a custom interface — any logging backend with an
+// slog adapter (and most have one) works without this library needing to
+// depend on it. Panics if logger is nil.
+func WithLogger(logger *slog.Logger) Option {
+	if logger == nil {
+		panic("saga: logger must not be nil")
+	}
+	return func(d *Definition) { d.logger = logger }
+}
+
+// WithMetrics configures lifecycle metrics reporting (see Metrics). If
+// not given, no metrics are recorded. Panics if metrics is nil.
+func WithMetrics(metrics Metrics) Option {
+	if metrics == nil {
+		panic("saga: metrics must not be nil")
+	}
+	return func(d *Definition) { d.metrics = metrics }
+}
+
+// WithTracer configures distributed tracing of each Execute (or
+// RecoveryManager.Recover resume) call as a single span (see Tracer). If
+// not given, no spans are created. Panics if tracer is nil.
+func WithTracer(tracer Tracer) Option {
+	if tracer == nil {
+		panic("saga: tracer must not be nil")
+	}
+	return func(d *Definition) { d.tracer = tracer }
 }

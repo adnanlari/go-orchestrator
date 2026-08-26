@@ -11,19 +11,30 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	saga "github.com/adnanlari/go-orchestrator"
 )
 
-// Store is an in-memory, concurrency-safe saga.Store.
+// Store is an in-memory, concurrency-safe saga.Store. It also implements
+// saga.Locker and saga.Lister.
 type Store struct {
-	mu   sync.RWMutex
-	data map[string]*saga.Execution
+	mu     sync.RWMutex
+	data   map[string]*saga.Execution
+	leases map[string]lease
+}
+
+type lease struct {
+	owner   string
+	expires time.Time
 }
 
 // New returns an empty, ready-to-use Store.
 func New() *Store {
-	return &Store{data: make(map[string]*saga.Execution)}
+	return &Store{
+		data:   make(map[string]*saga.Execution),
+		leases: make(map[string]lease),
+	}
 }
 
 // Save implements saga.Store.
@@ -63,4 +74,33 @@ func (s *Store) ListIncomplete(ctx context.Context) ([]*saga.Execution, error) {
 		}
 	}
 	return result, nil
+}
+
+// Acquire implements saga.Locker. A lease held by a different owner
+// blocks acquisition only until it expires; an expired lease (or one
+// that never existed) may be taken by anyone. The same owner calling
+// Acquire again before its lease expires renews it for another ttl from
+// now, which is how the engine keeps a lease alive for a
+// still-genuinely-progressing execution.
+func (s *Store) Acquire(ctx context.Context, id string, owner string, ttl time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	if l, ok := s.leases[id]; ok && l.owner != owner && now.Before(l.expires) {
+		return false, nil
+	}
+	s.leases[id] = lease{owner: owner, expires: now.Add(ttl)}
+	return true, nil
+}
+
+// Release implements saga.Locker. Releasing a lease a different owner
+// holds, or one that doesn't exist, is a no-op.
+func (s *Store) Release(ctx context.Context, id string, owner string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if l, ok := s.leases[id]; ok && l.owner == owner {
+		delete(s.leases, id)
+	}
+	return nil
 }

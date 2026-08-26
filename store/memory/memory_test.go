@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	saga "github.com/adnanlari/go-orchestrator"
 )
@@ -180,5 +181,98 @@ func TestStore_ListIncomplete_IsIndependentOfInternalStorage(t *testing.T) {
 	}
 	if got2.Status != saga.StatusRunning {
 		t.Errorf("stored Status = %q, want unchanged %q", got2.Status, saga.StatusRunning)
+	}
+}
+
+func TestStore_Acquire_BlocksDifferentOwner(t *testing.T) {
+	s := New()
+	ctx := context.Background()
+	ok, err := s.Acquire(ctx, "exec-1", "owner-A", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("first Acquire: ok=%v err=%v", ok, err)
+	}
+	ok, err = s.Acquire(ctx, "exec-1", "owner-B", time.Minute)
+	if err != nil || ok {
+		t.Fatalf("second Acquire by different owner: ok=%v err=%v, want ok=false", ok, err)
+	}
+}
+
+func TestStore_Acquire_SameOwnerRenews(t *testing.T) {
+	s := New()
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		ok, err := s.Acquire(ctx, "exec-1", "owner-A", time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("Acquire #%d: ok=%v err=%v", i, ok, err)
+		}
+	}
+}
+
+func TestStore_Release_AllowsReacquisition(t *testing.T) {
+	s := New()
+	ctx := context.Background()
+	if ok, err := s.Acquire(ctx, "exec-1", "owner-A", time.Minute); err != nil || !ok {
+		t.Fatalf("Acquire: ok=%v err=%v", ok, err)
+	}
+	if err := s.Release(ctx, "exec-1", "owner-A"); err != nil {
+		t.Fatalf("Release returned error: %v", err)
+	}
+	if ok, err := s.Acquire(ctx, "exec-1", "owner-B", time.Minute); err != nil || !ok {
+		t.Fatalf("Acquire after release: ok=%v err=%v, want ok=true", ok, err)
+	}
+}
+
+func TestStore_Release_WrongOwnerIsNoop(t *testing.T) {
+	s := New()
+	ctx := context.Background()
+	if ok, err := s.Acquire(ctx, "exec-1", "owner-A", time.Minute); err != nil || !ok {
+		t.Fatalf("Acquire: ok=%v err=%v", ok, err)
+	}
+	if err := s.Release(ctx, "exec-1", "owner-B"); err != nil {
+		t.Fatalf("Release returned error: %v", err)
+	}
+	if ok, err := s.Acquire(ctx, "exec-1", "owner-C", time.Minute); err != nil || ok {
+		t.Fatalf("Acquire by owner-C: ok=%v err=%v, want ok=false", ok, err)
+	}
+}
+
+func TestStore_Acquire_ExpiredLeaseCanBeReclaimed(t *testing.T) {
+	s := New()
+	ctx := context.Background()
+	if ok, err := s.Acquire(ctx, "exec-1", "owner-A", time.Millisecond); err != nil || !ok {
+		t.Fatalf("Acquire: ok=%v err=%v", ok, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if ok, err := s.Acquire(ctx, "exec-1", "owner-B", time.Minute); err != nil || !ok {
+		t.Fatalf("Acquire after expiry: ok=%v err=%v, want ok=true", ok, err)
+	}
+}
+
+func TestStore_Lock_ConcurrentUse(t *testing.T) {
+	s := New()
+	const n = 50
+	var wg sync.WaitGroup
+	var successCount int32
+	var mu sync.Mutex
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ok, err := s.Acquire(context.Background(), "exec-1", "owner", time.Minute)
+			if err != nil {
+				t.Errorf("Acquire returned error: %v", err)
+				return
+			}
+			if ok {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	// Same owner: every concurrent Acquire should succeed (renewal).
+	if int(successCount) != n {
+		t.Errorf("successCount = %d, want %d (same owner should always succeed)", successCount, n)
 	}
 }
