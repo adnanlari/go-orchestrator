@@ -19,6 +19,14 @@ import (
 // but whatever Action eventually returns is discarded in favor of a
 // timeout error, since a result arriving after the deadline can't be
 // trusted as timely.
+//
+// ctx also carries a stable idempotency key retrievable via
+// OperationID(ctx): the same value on every retry of this step and on
+// any re-invocation after crash recovery. Since Action may be invoked
+// more than once for what is logically the same operation (see
+// OperationID's doc comment), pass this key to any downstream dependency
+// that can deduplicate on one, so a retried or recovered attempt cannot
+// double up its real-world effect.
 type ActionFunc func(ctx context.Context, data any) (any, error)
 
 // CompensateFunc is a step's compensating action. It receives the
@@ -28,6 +36,10 @@ type ActionFunc func(ctx context.Context, data any) (any, error)
 //
 // A step with a nil CompensateFunc is treated as having nothing to undo:
 // compensation for that step is skipped.
+//
+// Like ActionFunc, ctx carries a stable idempotency key retrievable via
+// OperationID(ctx) — distinct from the key Action received for the same
+// step, since compensating is a different real-world operation.
 type CompensateFunc func(ctx context.Context, data any) error
 
 // StepDefinition is a named forward action paired with its compensating

@@ -174,7 +174,7 @@ func (d *Definition) resumeRunning(ctx context.Context, exec *Execution, sagaTim
 		// nothing to transition into (it's already there), so fall
 		// straight through to (re-)running it.
 
-		out, stepErr := d.runStep(ctx, sagaTimeoutErr, stepExec, step, data)
+		out, stepErr := d.runStep(ctx, sagaTimeoutErr, exec.ID, stepExec, step, data)
 		if stepErr != nil {
 			stepExec.Error = stepErr.Error()
 			if err := d.transitionStep(ctx, exec, stepExec, StepStatusFailed); err != nil {
@@ -218,16 +218,22 @@ func (d *Definition) resumeRunning(ctx context.Context, exec *Execution, sagaTim
 // takes precedence over retrying) or a *StepError wrapping the attempt's
 // own error (which may itself be a *StepTimeoutError; see callAction) —
 // never a bare, unwrapped action error.
-func (d *Definition) runStep(ctx context.Context, sagaTimeoutErr *SagaTimeoutError, stepExec *StepExecution, step StepDefinition, data any) (any, error) {
+//
+// Every attempt — the first, and every retry — carries the same
+// OperationID (derived from executionID and step.Name), since from a
+// downstream idempotency perspective they are all the same logical
+// operation being attempted again, not new ones.
+func (d *Definition) runStep(ctx context.Context, sagaTimeoutErr *SagaTimeoutError, executionID string, stepExec *StepExecution, step StepDefinition, data any) (any, error) {
 	policy := d.retryPolicyFor(step)
 	timeout := step.timeout
+	opID := operationID(executionID, step.Name)
 	for attempt := 1; ; attempt++ {
 		if ctx.Err() != nil {
 			return nil, context.Cause(ctx)
 		}
 
 		stepExec.Attempts++
-		out, err := d.callAction(ctx, step, timeout, data)
+		out, err := d.callAction(ctx, opID, step, timeout, data)
 
 		if sagaTimeoutErr != nil && errors.Is(context.Cause(ctx), sagaTimeoutErr) {
 			return nil, sagaTimeoutErr
@@ -252,15 +258,17 @@ func (d *Definition) runStep(ctx context.Context, sagaTimeoutErr *SagaTimeoutErr
 }
 
 // callAction invokes step.Action once, bounded by timeout if timeout >
-// 0. If the step's own timeout is specifically what elapses — as
-// opposed to the outer ctx ending for some unrelated reason — that
-// result is discarded, even if Action ignores the timeout and eventually
-// returns success anyway, since a result arriving after the deadline
-// this step was configured with can't be trusted as timely. An outer
-// ctx ending is left for the caller (runStep) to handle, since a step
-// timeout and a saga-level/external cancellation warrant different
-// responses (a step timeout retries per policy; the other never does).
-func (d *Definition) callAction(ctx context.Context, step StepDefinition, timeout time.Duration, data any) (any, error) {
+// 0, with ctx carrying opID (retrievable inside Action via OperationID).
+// If the step's own timeout is specifically what elapses — as opposed to
+// the outer ctx ending for some unrelated reason — that result is
+// discarded, even if Action ignores the timeout and eventually returns
+// success anyway, since a result arriving after the deadline this step
+// was configured with can't be trusted as timely. An outer ctx ending is
+// left for the caller (runStep) to handle, since a step timeout and a
+// saga-level/external cancellation warrant different responses (a step
+// timeout retries per policy; the other never does).
+func (d *Definition) callAction(ctx context.Context, opID string, step StepDefinition, timeout time.Duration, data any) (any, error) {
+	ctx = withOperationID(ctx, opID)
 	if timeout <= 0 {
 		return step.Action(ctx, data)
 	}
@@ -449,7 +457,8 @@ func (d *Definition) compensate(ctx context.Context, exec *Execution, failedAt i
 		// there is nothing to transition into, so fall straight through
 		// to (re-)invoking Compensate.
 
-		if cErr := compensateFn(ctx, stepExec.Output); cErr != nil {
+		compensateCtx := withOperationID(ctx, compensationOperationID(exec.ID, stepExec.Name))
+		if cErr := compensateFn(compensateCtx, stepExec.Output); cErr != nil {
 			stepExec.Error = cErr.Error()
 			if err := d.transitionStep(ctx, exec, stepExec, StepStatusCompensationFailed); err != nil {
 				return false, err
