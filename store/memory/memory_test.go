@@ -120,3 +120,65 @@ func TestStore_ConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestStore_ListIncomplete_OnlyNonTerminal(t *testing.T) {
+	s := New()
+	ctx := context.Background()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("Save returned error: %v", err)
+		}
+	}
+	must(s.Save(ctx, &saga.Execution{ID: "running", Status: saga.StatusRunning}))
+	must(s.Save(ctx, &saga.Execution{ID: "compensating", Status: saga.StatusCompensating}))
+	must(s.Save(ctx, &saga.Execution{ID: "completed", Status: saga.StatusCompleted}))
+	must(s.Save(ctx, &saga.Execution{ID: "failed", Status: saga.StatusFailed}))
+
+	got, err := s.ListIncomplete(ctx)
+	if err != nil {
+		t.Fatalf("ListIncomplete returned error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2", len(got))
+	}
+	ids := map[string]bool{}
+	for _, exec := range got {
+		ids[exec.ID] = true
+	}
+	if !ids["running"] || !ids["compensating"] {
+		t.Errorf("got ids = %v, want running and compensating", ids)
+	}
+}
+
+func TestStore_ListIncomplete_Empty(t *testing.T) {
+	s := New()
+	got, err := s.ListIncomplete(context.Background())
+	if err != nil {
+		t.Fatalf("ListIncomplete returned error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("len(got) = %d, want 0", len(got))
+	}
+}
+
+func TestStore_ListIncomplete_IsIndependentOfInternalStorage(t *testing.T) {
+	s := New()
+	if err := s.Save(context.Background(), &saga.Execution{ID: "exec-1", Status: saga.StatusRunning}); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	got, err := s.ListIncomplete(context.Background())
+	if err != nil {
+		t.Fatalf("ListIncomplete returned error: %v", err)
+	}
+	got[0].Status = saga.StatusCompleted // mutate the caller's copy
+
+	got2, err := s.Get(context.Background(), "exec-1")
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if got2.Status != saga.StatusRunning {
+		t.Errorf("stored Status = %q, want unchanged %q", got2.Status, saga.StatusRunning)
+	}
+}

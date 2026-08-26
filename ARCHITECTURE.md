@@ -146,6 +146,10 @@ exponential backoff, jitter, and non-retryable errors), and saga-level
 and step-level timeouts (via context.WithTimeoutCause/context.Cause, so
 a saga timeout, a step timeout, and plain external cancellation are all
 distinguishable via errors.As even though they share the same
-context.Context cancellation mechanism) all exist. Not yet implemented:
-crash recovery, idempotency keys, execution locking, hooks/events, and
-pluggable observability.
+context.Context cancellation mechanism), and crash recovery
+(RecoveryManager, built on a new Lister interface for enumerating
+incomplete executions) all exist. Execute and recovery now share one
+underlying resumable engine (Definition.resume): a fresh Execute call is
+simply resuming a brand-new, all-Pending Execution. Not yet implemented:
+idempotency keys, execution locking, hooks/events, and pluggable
+observability.

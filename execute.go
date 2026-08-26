@@ -56,16 +56,13 @@ import (
 // Execute freezes the Definition on first call (see Definition.Freeze),
 // so it is safe to call Execute concurrently with other Execute calls,
 // but not concurrently with AddStep.
+//
+// Execute is the entry point for a brand-new run. Crash recovery
+// (RecoveryManager) drives an already-started Execution back to a
+// terminal status the same way, via the same underlying engine — see
+// resume.
 func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error) {
 	d.Freeze()
-
-	var sagaTimeoutErr *SagaTimeoutError
-	if d.timeout > 0 {
-		sagaTimeoutErr = &SagaTimeoutError{Saga: d.name, Timeout: d.timeout}
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeoutCause(ctx, d.timeout, sagaTimeoutErr)
-		defer cancel()
-	}
 
 	now := time.Now()
 	exec := &Execution{
@@ -84,12 +81,80 @@ func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error)
 		return exec, err
 	}
 
-	if err := d.transitionExec(ctx, exec, StatusRunning); err != nil {
-		return exec, err
+	return d.resume(ctx, exec)
+}
+
+// resume drives exec forward to a terminal status starting from wherever
+// its persisted Status and per-step Statuses say it currently is,
+// rather than assuming a brand-new run. Execute calls it immediately
+// after creating a fresh (all StepStatusPending) Execution; a
+// RecoveryManager calls it with an Execution loaded from a Store after a
+// process restart, possibly with steps already Succeeded, one step
+// still Running or Compensating (interrupted mid-attempt when the prior
+// process exited), or already in a state that only needs the saga-level
+// Status to catch up (e.g. a step recorded Failed but the process died
+// before the transition to Compensating was persisted).
+//
+// Resuming a step (or its compensation) found already Running (or
+// Compensating) means invoking it again without knowing whether the
+// interrupted attempt already took effect for real — this is what
+// "at-least-once execution" means in practice, and is only safe if that
+// step's Action (and Compensate) are idempotent.
+func (d *Definition) resume(ctx context.Context, exec *Execution) (*Execution, error) {
+	var sagaTimeoutErr *SagaTimeoutError
+	if d.timeout > 0 {
+		sagaTimeoutErr = &SagaTimeoutError{Saga: d.name, Timeout: d.timeout}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeoutCause(ctx, d.timeout, sagaTimeoutErr)
+		defer cancel()
 	}
 
-	data := input
-	for i, step := range d.steps {
+	switch exec.Status {
+	case StatusCompleted, StatusFailed, StatusCompensated, StatusCompensationFailed:
+		return exec, nil // already terminal; nothing to resume
+	case StatusCompensating:
+		return exec, d.resumeCompensating(ctx, exec)
+	case StatusPending:
+		if err := d.transitionExec(ctx, exec, StatusRunning); err != nil {
+			return exec, err
+		}
+		return d.resumeRunning(ctx, exec, sagaTimeoutErr)
+	default: // StatusRunning
+		return d.resumeRunning(ctx, exec, sagaTimeoutErr)
+	}
+}
+
+// resumeRunning drives exec's forward-execution loop starting from
+// wherever its persisted Steps say it left off:
+//   - a step already StepStatusSucceeded is skipped; its Output becomes
+//     the next step's input, exactly as if execution had never stopped.
+//   - a step found StepStatusFailed means the process exited after
+//     recording that failure but before persisting the saga-level
+//     transition that should have followed — resume re-enters abort for
+//     it directly, rather than mistaking it for pending work.
+//   - a step found StepStatusPending or StepStatusRunning is (re-)run
+//     normally; see the package documentation on why re-running a step
+//     that was mid-attempt when the process exited is only safe for
+//     idempotent steps.
+func (d *Definition) resumeRunning(ctx context.Context, exec *Execution, sagaTimeoutErr *SagaTimeoutError) (*Execution, error) {
+	for i, s := range exec.Steps {
+		if s.Status == StepStatusFailed {
+			return exec, d.abort(ctx, exec, i, &StepError{Step: s.Name, Err: errors.New(s.Error)})
+		}
+	}
+
+	data := exec.Input
+	startAt := 0
+	for i := range exec.Steps {
+		if exec.Steps[i].Status != StepStatusSucceeded {
+			break
+		}
+		startAt = i + 1
+		data = exec.Steps[i].Output
+	}
+
+	for i := startAt; i < len(d.steps); i++ {
+		step := d.steps[i]
 		select {
 		case <-ctx.Done():
 			exec.CurrentStep = ""
@@ -99,9 +164,15 @@ func (d *Definition) Execute(ctx context.Context, input any) (*Execution, error)
 
 		exec.CurrentStep = step.Name
 		stepExec := &exec.Steps[i]
-		if err := d.transitionStep(ctx, exec, stepExec, StepStatusRunning); err != nil {
-			return exec, err
+		if stepExec.Status == StepStatusPending {
+			if err := d.transitionStep(ctx, exec, stepExec, StepStatusRunning); err != nil {
+				return exec, err
+			}
 		}
+		// If stepExec.Status is already StepStatusRunning, a prior
+		// process was already mid-attempt on it when it exited; there is
+		// nothing to transition into (it's already there), so fall
+		// straight through to (re-)running it.
 
 		out, stepErr := d.runStep(ctx, sagaTimeoutErr, stepExec, step, data)
 		if stepErr != nil {
@@ -261,7 +332,45 @@ func (d *Definition) abort(ctx context.Context, exec *Execution, failedAt int, o
 	if err := d.transitionExec(ctx, exec, StatusCompensating); err != nil {
 		return err
 	}
+	return d.finishCompensating(ctx, exec, failedAt, originalErr)
+}
 
+// resumeCompensating drives exec's compensation loop starting from
+// wherever its persisted Steps say it left off: a step already
+// StepStatusCompensated is never compensated again — this, together with
+// compensate's own per-step status check, is what guarantees recovery
+// never duplicates a compensation — and a step found StepStatusCompensating
+// (interrupted mid-compensate when the prior process exited) has its
+// Compensate re-invoked, subject to the same idempotency caveat resume
+// documents for re-running a step's Action.
+//
+// failedAt is reconstructed from persisted step statuses rather than
+// stored directly: since forward execution is strictly sequential, every
+// step that ever reached StepStatusSucceeded (or further, into
+// compensation) is necessarily a prefix of the steps, so one past the
+// highest such index is exactly the boundary the original abort call
+// used.
+func (d *Definition) resumeCompensating(ctx context.Context, exec *Execution) error {
+	failedAt := 0
+	for i, s := range exec.Steps {
+		switch s.Status {
+		case StepStatusSucceeded, StepStatusCompensating, StepStatusCompensated, StepStatusCompensationFailed:
+			failedAt = i + 1
+		}
+	}
+	// exec.Error holds the original forward failure's message from
+	// before the process exited; only the message survives a crash; its
+	// specific type (e.g. *StepError) does not.
+	return d.finishCompensating(ctx, exec, failedAt, errors.New(exec.Error))
+}
+
+// finishCompensating runs compensation for the steps before failedAt
+// (see compensate) and settles exec on StatusCompensated or
+// StatusCompensationFailed, preserving originalErr in the returned error
+// exactly as abort's doc comment describes. Shared by abort (a fresh
+// failure) and resumeCompensating (continuing one interrupted by a
+// process exit).
+func (d *Definition) finishCompensating(ctx context.Context, exec *Execution, failedAt int, originalErr error) error {
 	// Compensation must still run to completion even when ctx is itself
 	// the reason we're aborting (cancelled or timed out) — otherwise a
 	// caller giving up on the request would also abandon cleanup,
@@ -299,20 +408,29 @@ func anySucceeded(steps []StepExecution) bool {
 }
 
 // compensate runs the compensating action, in reverse order, for every
-// step before failedAt that succeeded and has a non-nil Compensate.
-// Steps with a nil Compensate are skipped (nothing to undo) and are left
-// at StepStatusSucceeded rather than marked compensated.
+// step before failedAt that has something left to compensate — either
+// StepStatusSucceeded (not yet compensated at all) or
+// StepStatusCompensating (a compensation interrupted by a process exit,
+// resumed here) — and has a non-nil Compensate. Steps with a nil
+// Compensate are skipped (nothing to undo) and are left at
+// StepStatusSucceeded rather than marked compensated. A step already
+// StepStatusCompensated or StepStatusCompensationFailed is left exactly
+// as it is: this is what prevents recovery from ever compensating the
+// same step twice.
 //
 // It keeps compensating remaining steps even after one fails, so as much
 // of the saga as possible gets rolled back rather than stopping at the
-// first compensation error. It reports whether every attempted
-// compensation succeeded; a non-nil error means persisting a state
-// change failed and compensation was abandoned partway through.
+// first compensation error. Its final "did everything succeed" answer is
+// computed by re-reading every step's status after the loop, not by
+// tracking success only across this one call — so a step left
+// StepStatusCompensationFailed by an earlier, interrupted attempt still
+// correctly counts against the overall result even though this call
+// never re-attempts it. It reports a non-nil error only if persisting a
+// state change failed and compensation was abandoned partway through.
 func (d *Definition) compensate(ctx context.Context, exec *Execution, failedAt int) (bool, error) {
-	ok := true
 	for i := failedAt - 1; i >= 0; i-- {
 		stepExec := &exec.Steps[i]
-		if stepExec.Status != StepStatusSucceeded {
+		if stepExec.Status != StepStatusSucceeded && stepExec.Status != StepStatusCompensating {
 			continue
 		}
 		compensateFn := d.steps[i].Compensate
@@ -321,19 +439,33 @@ func (d *Definition) compensate(ctx context.Context, exec *Execution, failedAt i
 		}
 
 		exec.CurrentStep = stepExec.Name
-		if err := d.transitionStep(ctx, exec, stepExec, StepStatusCompensating); err != nil {
-			return false, err
+		if stepExec.Status == StepStatusSucceeded {
+			if err := d.transitionStep(ctx, exec, stepExec, StepStatusCompensating); err != nil {
+				return false, err
+			}
 		}
+		// If stepExec.Status is already StepStatusCompensating, a prior
+		// process was already mid-compensate on it when it exited;
+		// there is nothing to transition into, so fall straight through
+		// to (re-)invoking Compensate.
+
 		if cErr := compensateFn(ctx, stepExec.Output); cErr != nil {
 			stepExec.Error = cErr.Error()
 			if err := d.transitionStep(ctx, exec, stepExec, StepStatusCompensationFailed); err != nil {
 				return false, err
 			}
-			ok = false
 			continue
 		}
 		if err := d.transitionStep(ctx, exec, stepExec, StepStatusCompensated); err != nil {
 			return false, err
+		}
+	}
+
+	ok := true
+	for i := 0; i < failedAt; i++ {
+		if exec.Steps[i].Status == StepStatusCompensationFailed {
+			ok = false
+			break
 		}
 	}
 	return ok, nil

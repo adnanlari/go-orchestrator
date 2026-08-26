@@ -51,3 +51,16 @@ func (s *Store) Get(ctx context.Context, id string) (*saga.Execution, error) {
 	}
 	return exec.Clone(), nil
 }
+
+// ListIncomplete implements saga.Lister.
+func (s *Store) ListIncomplete(ctx context.Context) ([]*saga.Execution, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*saga.Execution
+	for _, exec := range s.data {
+		if !exec.Status.IsTerminal() {
+			result = append(result, exec.Clone())
+		}
+	}
+	return result, nil
+}

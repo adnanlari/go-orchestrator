@@ -27,6 +27,21 @@ type Store interface {
 	Get(ctx context.Context, id string) (*Execution, error)
 }
 
+// Lister is implemented by a Store that can enumerate its own
+// executions, which crash recovery needs in order to find work after a
+// restart — a plain Store can only be asked about one already-known ID
+// at a time. It is a separate interface from Store, rather than folded
+// into it, so a Store that genuinely cannot list efficiently (a
+// write-mostly audit sink, for example) isn't forced to implement it;
+// RecoveryManager simply requires whatever Store it's given to also
+// satisfy Lister.
+type Lister interface {
+	// ListIncomplete returns every persisted execution whose Status is
+	// not terminal (see Status.IsTerminal), in no particular order —
+	// RecoveryManager sorts the results itself before acting on them.
+	ListIncomplete(ctx context.Context) ([]*Execution, error)
+}
+
 // noopStore is the Store used when a Definition is not configured
 // WithStore. It discards everything, so a Definition behaves exactly as
 // it did before Store existed unless a caller opts in.
